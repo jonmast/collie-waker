@@ -1,0 +1,42 @@
+collie-waker has been installed.
+
+Release:    {{ .Release.Name }}
+Namespace:  {{ .Release.Namespace }}
+Service:    {{ include "bjw-s.common.lib.chart.names.fullname" . }}.{{ .Release.Namespace }}.svc
+              :{{ .Values.service.main.ports.http.port }}    waker HTTP (Traefik fallback)
+              :{{ .Values.service.main.ports.tunnel.port }}    SSH tunnel to Collie (Traefik primary)
+
+{{- if not .Values.ssh.existingSecret }}
+
+NOTE: You have not set ssh.existingSecret. The pod cannot open the SSH tunnel to
+the dev box, so the Traefik primary will never come up. Create the Secret and
+enable the ssh-key volume:
+
+  ssh-keygen -t ed25519 -N '' -f ~/.ssh/collie-waker
+  ssh-keyscan -H {{ required "ssh.host is required" .Values.ssh.host }} > known_hosts
+
+  kubectl create secret generic collie-waker-ssh-key \
+    --namespace {{ .Release.Namespace }} \
+    --from-file=ssh-privatekey=~/.ssh/collie-waker \
+    --from-file=known_hosts=known_hosts
+
+Append the public key to ~{{ .Values.ssh.user }}/.ssh/authorized_keys on the dev
+box, then enable the volume and upgrade:
+
+  helm upgrade {{ .Release.Name }} ./charts/collie-waker \
+    --reuse-values \
+    --set ssh.existingSecret=collie-waker-ssh-key \
+    --set persistence.ssh-key.enabled=true
+
+{{- end }}
+
+Traefik wiring (see jonmast/k8s-conf apps/collie-waker/routes.yaml): a failover
+TraefikService whose primary is port {{ .Values.service.main.ports.tunnel.port }} of this Service, health-checked on
+the Collie path with hostname {{ .Values.waker.publicHost }}, and whose fallback is port {{ .Values.service.main.ports.http.port }}.
+
+Quick check:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward \
+      svc/{{ include "bjw-s.common.lib.chart.names.fullname" . }} 8080:{{ .Values.service.main.ports.http.port }}
+  curl -s http://localhost:8080/healthz
+  curl -sI http://localhost:8080/          # 307 once the box is awake

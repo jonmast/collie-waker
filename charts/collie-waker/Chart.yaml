@@ -1,0 +1,18 @@
+apiVersion: v2
+name: collie-waker
+description: Wake-on-LAN waker and SSH tunnel that keeps Collie reachable at a stable URL.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/jonmast/collie-waker
+keywords:
+  - collie
+  - wake-on-lan
+  - ssh-tunnel
+  - traefik
+maintainers:
+  - name: jonmast
+dependencies:
+  - name: common
+    version: 5.0.1
+    repository: https://bjw-s-labs.github.io/helm-charts

@@ -1,0 +1,223 @@
+# ============================================================================
+# collie-waker — bjw-s common library chart values
+# ============================================================================
+# Required at install time (override via -f or --set):
+#   waker.publicHost, ssh.host, ssh.user, wol.macAddress
+#
+# Defaults here match the HelmRelease in jonmast/k8s-conf
+# (apps/collie-waker/release.yaml) so that release only overrides, never fights,
+# the chart.
+# ============================================================================
+
+# -- Waker HTTP handler behaviour.
+waker:
+  # -- Public host Collie validates against. Sent as the Host header when the
+  #    waker polls Collie, and the target of the 307 redirect.
+  publicHost: ""        # required
+  # -- Where the waker polls Collie, through the SSH tunnel below.
+  pollUrl: http://127.0.0.1:8787/api/snapshot
+  # -- Give up waking after this long, then serve a 503 auto-reload page.
+  timeoutSeconds: 45
+  # -- After Collie answers, wait one Traefik health-check interval so the
+  #    failover has flipped back to the primary before issuing the 307.
+  healthIntervalSeconds: 5
+  # -- At most one magic packet per this many seconds.
+  wolRateLimitSeconds: 10
+  # -- Delay between polls of Collie while waiting for it to come up.
+  pollIntervalMs: 1000
+  listenPort: 8080
+
+# -- Wake-on-LAN target.
+wol:
+  macAddress: ""        # required, XX:XX:XX:XX:XX:XX
+  broadcastAddr: 255.255.255.255
+  port: 9
+
+# -- SSH tunnel to the dev box. Collie binds 127.0.0.1:8787 there, so the
+#    cluster reaches it only through this tunnel.
+ssh:
+  host: ""              # required
+  user: ""              # required
+  port: 22
+  # -- Bind the forward on the pod interface, not the pod loopback, so Traefik's
+  #    primary upstream and health check reach it via the Service.
+  tunnelBindAddr: 0.0.0.0
+  tunnelLocalPort: 8787
+  collieServerPort: 8787
+  # -- Name of an existing Secret holding `ssh-privatekey` and `known_hosts`.
+  existingSecret: ""
+  # -- HOME for the `ssh` client inside the pod. Backed by an emptyDir (the root
+  #    filesystem is read-only) and used as the base for `mountPath` below, so no
+  #    dev-box username is baked into the chart. Override both together if you
+  #    point `mountPath` somewhere else.
+  homeDir: /home/collie
+  mountPath: "{{ .Values.ssh.homeDir }}/.ssh"
+  strictHostKeyChecking: accept-new
+
+# -- Container image. Users override these with --set, no deep nesting needed.
+image:
+  repository: ghcr.io/jonmast/collie-waker
+  # -- Image tag. May include @sha256:... digest. Defaults to .Chart.AppVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# ============================================================================
+# bjw-s common library chart — https://bjw-s-labs.github.io/helm-charts
+# ============================================================================
+
+global:
+  # -- (string) Override the chart name used in resource names.
+  nameOverride: ""
+  # -- (string) Override the fullname used in resource names.
+  fullnameOverride: ""
+  labels: {}
+
+defaultPodOptions:
+  # Required for Wake-on-LAN: the pod must share the node's network namespace
+  # so UDP broadcasts reach the physical LAN.
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  terminationGracePeriodSeconds: 30
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  imagePullSecrets: []
+
+controllers:
+  main:
+    type: deployment
+    replicas: 1
+    strategy: Recreate
+
+    pod:
+      annotations: {}
+
+    containers:
+      main:
+        image:
+          repository: "{{ .Values.image.repository }}"
+          tag: "{{ .Values.image.tag | default .Chart.AppVersion }}"
+          pullPolicy: IfNotPresent
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          capabilities:
+            drop:
+              - ALL
+
+        ports:
+          - name: http
+            containerPort: 8080
+            protocol: TCP
+          - name: tunnel
+            containerPort: 8787
+            protocol: TCP
+
+        envFrom:
+          - configMapRef:
+              identifier: env
+
+        # Liveness only, deliberately no readiness. This pod's Service carries
+        # both the SSH tunnel (Traefik's primary upstream) and the waker HTTP
+        # handler (the fallback). A failing readiness probe would withdraw every
+        # endpoint for the pod, taking the tunnel — and therefore the primary —
+        # down with it.
+        probes:
+          liveness:
+            enabled: true
+            type: HTTP
+            path: /healthz
+            port: http
+            spec:
+              initialDelaySeconds: 5
+              periodSeconds: 15
+              timeoutSeconds: 3
+              failureThreshold: 3
+          readiness:
+            enabled: false
+          startup:
+            enabled: false
+
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+
+service:
+  main:
+    controller: main
+    type: ClusterIP
+    ports:
+      http:
+        port: 8080
+        protocol: TCP
+      tunnel:
+        port: 8787
+        protocol: TCP
+
+configMaps:
+  env:
+    data:
+      PORT: "{{ .Values.waker.listenPort }}"
+      PUBLIC_HOST: "{{ required `waker.publicHost is required` .Values.waker.publicHost }}"
+      POLL_URL: "{{ .Values.waker.pollUrl }}"
+      TIMEOUT_SECONDS: "{{ .Values.waker.timeoutSeconds }}"
+      HEALTH_INTERVAL_SECONDS: "{{ .Values.waker.healthIntervalSeconds }}"
+      WOL_RATE_LIMIT_SECONDS: "{{ .Values.waker.wolRateLimitSeconds }}"
+      POLL_INTERVAL_MS: "{{ .Values.waker.pollIntervalMs }}"
+      WOL_MAC_ADDRESS: "{{ required `wol.macAddress is required` .Values.wol.macAddress }}"
+      WOL_BROADCAST_ADDR: "{{ .Values.wol.broadcastAddr }}"
+      WOL_PORT: "{{ .Values.wol.port }}"
+      SSH_HOST: "{{ required `ssh.host is required` .Values.ssh.host }}"
+      SSH_USER: "{{ required `ssh.user is required` .Values.ssh.user }}"
+      SSH_PORT: "{{ .Values.ssh.port }}"
+      HOME: "{{ .Values.ssh.homeDir }}"
+      SSH_MOUNT_PATH: "{{ tpl .Values.ssh.mountPath . }}"
+      SSH_KEY_PATH: "{{ printf `%s/ssh-privatekey` (tpl .Values.ssh.mountPath .) }}"
+      SSH_KNOWN_HOSTS_PATH: "{{ printf `%s/known_hosts` (tpl .Values.ssh.mountPath .) }}"
+      SSH_STRICT_HOST_KEY_CHECKING: "{{ .Values.ssh.strictHostKeyChecking }}"
+      TUNNEL_BIND_ADDR: "{{ .Values.ssh.tunnelBindAddr }}"
+      TUNNEL_LOCAL_PORT: "{{ .Values.ssh.tunnelLocalPort }}"
+      COLLIE_SERVER_PORT: "{{ .Values.ssh.collieServerPort }}"
+      RUST_LOG: "info"
+
+persistence:
+  tmp:
+    type: emptyDir
+    globalMounts:
+      - path: /tmp
+  home:
+    type: emptyDir
+    globalMounts:
+      - path: "{{ .Values.ssh.homeDir }}"
+  ssh-key:
+    enabled: false
+    type: secret
+    name: "{{ .Values.ssh.existingSecret }}"
+    defaultMode: 384
+    globalMounts:
+      # Not `.Values.ssh.mountPath`: the common chart templates this field only
+      # once, so a value that is itself a template would land here unrendered.
+      - path: "{{ .Values.ssh.homeDir }}/.ssh"
+        readOnly: true
+
+serviceAccount:
+  main:
+    annotations: {}
