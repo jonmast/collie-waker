@@ -14,8 +14,9 @@ waker:
   # -- Public host Collie validates against. Sent as the Host header when the
   #    waker polls Collie, and the target of the 307 redirect.
   publicHost: ""        # required
-  # -- Where the waker polls Collie, through the SSH tunnel below.
-  pollUrl: http://127.0.0.1:8787/api/snapshot
+  # -- Where the waker polls Collie. The tunnel now lives in its own pod, so
+  #    this goes through that pod's Service rather than a local forward.
+  pollUrl: 'http://{{ include "bjw-s.common.lib.chart.names.fullname" . }}-tunnel:{{ .Values.service.tunnel.ports.tunnel.port }}/api/snapshot'
   # -- Give up waking after this long, then serve a 503 auto-reload page.
   timeoutSeconds: 45
   # -- After Collie answers, wait one Traefik health-check interval so the
@@ -73,10 +74,11 @@ global:
   labels: {}
 
 defaultPodOptions:
-  # Required for Wake-on-LAN: the pod must share the node's network namespace
-  # so UDP broadcasts reach the physical LAN.
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
+  # NOTE: hostNetwork is deliberately NOT set here. It is set on the waker
+  # controller alone (see controllers.main below), because sharing the node's
+  # network namespace publishes every port the pod binds on every interface of
+  # the node. The tunnel is unrestricted access to Collie — effectively a root
+  # shell — so it stays in an ordinary pod, reachable only via its Service.
   securityContext:
     runAsNonRoot: true
     runAsUser: 65532
@@ -94,6 +96,9 @@ defaultPodOptions:
   imagePullSecrets: []
 
 controllers:
+  # -- The waker: Traefik's fallback. Runs with hostNetwork so the magic packet
+  #    actually reaches the LAN, and therefore binds :8080 on the node — keep
+  #    this side free of anything that grants access to Collie.
   main:
     type: deployment
     replicas: 1
@@ -101,6 +106,8 @@ controllers:
 
     pod:
       annotations: {}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
 
     containers:
       main:
@@ -109,7 +116,7 @@ controllers:
           tag: "{{ .Values.image.tag | default .Chart.AppVersion }}"
           pullPolicy: IfNotPresent
 
-        securityContext:
+        securityContext: &containerSecurity
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           runAsNonRoot: true
@@ -123,20 +130,19 @@ controllers:
           - name: http
             containerPort: 8080
             protocol: TCP
-          - name: tunnel
-            containerPort: 8787
-            protocol: TCP
+
+        env:
+          ROLE: waker
 
         envFrom:
           - configMapRef:
               identifier: env
 
-        # Liveness only, deliberately no readiness. This pod's Service carries
-        # both the SSH tunnel (Traefik's primary upstream) and the waker HTTP
-        # handler (the fallback). A failing readiness probe would withdraw every
-        # endpoint for the pod, taking the tunnel — and therefore the primary —
-        # down with it.
-        probes:
+        # Liveness only, deliberately no readiness: a failing readiness probe
+        # withdraws the endpoint, and an unreachable fallback means Traefik has
+        # nowhere to send traffic while the dev box is asleep — exactly when the
+        # waker is needed.
+        probes: &probes
           liveness:
             enabled: true
             type: HTTP
@@ -152,7 +158,7 @@ controllers:
           startup:
             enabled: false
 
-        resources:
+        resources: &resources
           requests:
             cpu: 10m
             memory: 32Mi
@@ -160,16 +166,65 @@ controllers:
             cpu: 500m
             memory: 128Mi
 
+  # -- The tunnel: Traefik's primary upstream. An ordinary pod, so the forward
+  #    to Collie is confined to the cluster network and reachable only through
+  #    its Service. This is the whole reason the two halves are separate.
+  tunnel:
+    type: deployment
+    replicas: 1
+    strategy: Recreate
+
+    pod:
+      annotations: {}
+
+    containers:
+      main:
+        image:
+          repository: "{{ .Values.image.repository }}"
+          tag: "{{ .Values.image.tag | default .Chart.AppVersion }}"
+          pullPolicy: IfNotPresent
+
+        securityContext: *containerSecurity
+
+        ports:
+          - name: tunnel
+            containerPort: 8787
+            protocol: TCP
+          - name: http
+            containerPort: 8080
+            protocol: TCP
+
+        env:
+          ROLE: tunnel
+
+        envFrom:
+          - configMapRef:
+              identifier: env
+
+        probes: *probes
+
+        resources: *resources
+
 service:
+  # Traefik's fallback.
   main:
     controller: main
+    primary: true
     type: ClusterIP
     ports:
       http:
         port: 8080
+        primary: true
         protocol: TCP
+
+  # Traefik's primary upstream, and what the waker polls while waking the box.
+  tunnel:
+    controller: tunnel
+    type: ClusterIP
+    ports:
       tunnel:
         port: 8787
+        primary: true
         protocol: TCP
 
 configMaps:
@@ -177,7 +232,7 @@ configMaps:
     data:
       PORT: "{{ .Values.waker.listenPort }}"
       PUBLIC_HOST: "{{ required `waker.publicHost is required` .Values.waker.publicHost }}"
-      POLL_URL: "{{ .Values.waker.pollUrl }}"
+      POLL_URL: "{{ tpl .Values.waker.pollUrl . }}"
       TIMEOUT_SECONDS: "{{ .Values.waker.timeoutSeconds }}"
       HEALTH_INTERVAL_SECONDS: "{{ .Values.waker.healthIntervalSeconds }}"
       WOL_RATE_LIMIT_SECONDS: "{{ .Values.waker.wolRateLimitSeconds }}"
@@ -203,20 +258,29 @@ persistence:
     type: emptyDir
     globalMounts:
       - path: /tmp
+  # HOME for the ssh client. Only the tunnel role runs ssh.
   home:
     type: emptyDir
-    globalMounts:
-      - path: "{{ .Values.ssh.homeDir }}"
+    advancedMounts:
+      tunnel:
+        main:
+          - path: "{{ .Values.ssh.homeDir }}"
+  # The private key is mounted into the tunnel pod alone. The waker has no use
+  # for it and should not be able to reach the dev box if it is ever exploited
+  # through its node-exposed port.
   ssh-key:
     enabled: false
     type: secret
     name: "{{ .Values.ssh.existingSecret }}"
     defaultMode: 384
-    globalMounts:
-      # Not `.Values.ssh.mountPath`: the common chart templates this field only
-      # once, so a value that is itself a template would land here unrendered.
-      - path: "{{ .Values.ssh.homeDir }}/.ssh"
-        readOnly: true
+    advancedMounts:
+      tunnel:
+        main:
+          # Not `.Values.ssh.mountPath`: the common chart templates this field
+          # only once, so a value that is itself a template would land here
+          # unrendered.
+          - path: "{{ .Values.ssh.homeDir }}/.ssh"
+            readOnly: true
 
 serviceAccount:
   main:

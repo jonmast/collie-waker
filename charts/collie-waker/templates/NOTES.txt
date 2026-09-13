@@ -2,15 +2,21 @@ collie-waker has been installed.
 
 Release:    {{ .Release.Name }}
 Namespace:  {{ .Release.Namespace }}
-Service:    {{ include "bjw-s.common.lib.chart.names.fullname" . }}.{{ .Release.Namespace }}.svc
-              :{{ .Values.service.main.ports.http.port }}    waker HTTP (Traefik fallback)
-              :{{ .Values.service.main.ports.tunnel.port }}    SSH tunnel to Collie (Traefik primary)
+
+Two deployments, deliberately separate:
+
+  {{ include "bjw-s.common.lib.chart.names.fullname" . }}          waker, hostNetwork, :{{ .Values.service.main.ports.http.port }}    (Traefik fallback)
+  {{ include "bjw-s.common.lib.chart.names.fullname" . }}-tunnel   ssh tunnel, pod network, :{{ .Values.service.tunnel.ports.tunnel.port }}  (Traefik primary)
+
+The waker needs the node's network namespace to broadcast a magic packet, which
+publishes its port on every node interface. The tunnel is unrestricted access to
+Collie, so it stays in an ordinary pod where only its Service can reach it.
 
 {{- if not .Values.ssh.existingSecret }}
 
-NOTE: You have not set ssh.existingSecret. The pod cannot open the SSH tunnel to
-the dev box, so the Traefik primary will never come up. Create the Secret and
-enable the ssh-key volume:
+NOTE: You have not set ssh.existingSecret. The tunnel cannot reach the dev box,
+so the Traefik primary will never come up. Create the Secret and enable the
+ssh-key volume:
 
   ssh-keygen -t ed25519 -N '' -f ~/.ssh/collie-waker
   ssh-keyscan -H {{ required "ssh.host is required" .Values.ssh.host }} > known_hosts
@@ -31,8 +37,9 @@ box, then enable the volume and upgrade:
 {{- end }}
 
 Traefik wiring (see jonmast/k8s-conf apps/collie-waker/routes.yaml): a failover
-TraefikService whose primary is port {{ .Values.service.main.ports.tunnel.port }} of this Service, health-checked on
-the Collie path with hostname {{ .Values.waker.publicHost }}, and whose fallback is port {{ .Values.service.main.ports.http.port }}.
+TraefikService whose primary is port {{ .Values.service.tunnel.ports.tunnel.port }} of the -tunnel Service,
+health-checked on the Collie path with hostname {{ .Values.waker.publicHost }}, and whose fallback
+is port {{ .Values.service.main.ports.http.port }} of the waker Service.
 
 Quick check:
 

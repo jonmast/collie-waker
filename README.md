@@ -5,15 +5,15 @@ stable URL — `https://collie.example.com` — even when the dev box it runs on
 
 Collie binds `127.0.0.1:8787` on the dev box (`192.0.2.10`, the same machine
 [`llm-wake-proxy`](https://github.com/jonmast/llm-wake-proxy) wakes), so there is no LAN-exposed
-port. This pod provides both halves of the answer: the **SSH tunnel** the cluster reaches Collie
+port. This repo provides both halves of the answer: the **SSH tunnel** the cluster reaches Collie
 through, and the **waker** that fires a magic packet when the box is asleep.
 
 ## Request flow
 
 ```
 phone (PWA) ──HTTPS──▶ Traefik ──▶ collie-failover (TraefikService)
-                                     ├─ primary  : SSH tunnel ▶ Collie @ dev box 127.0.0.1:8787
-                                     └─ fallback : waker pod (fires WoL, polls, 307s back)
+                                     ├─ primary  : tunnel pod ▶ Collie @ dev box 127.0.0.1:8787
+                                     └─ fallback : waker pod  (fires WoL, polls, 307s back)
 ```
 
 Traefik health-checks the primary on `/api/snapshot`. While the box is up, that check passes and
@@ -29,8 +29,23 @@ fails, and Traefik fails over to the waker, which:
 4. Issues a `307` back to the same URL, which now reaches Collie itself.
 5. On `waker.timeoutSeconds` expiry, serves a `503` auto-reload page instead.
 
-Both the tunnel and the waker live in one container: the Service exposes port `8787` (tunnel,
-Traefik's primary) and `8080` (waker HTTP, the fallback).
+## Two pods, one image
+
+The tunnel and the waker are **separate deployments**, selected by `ROLE`:
+
+| Deployment | Role | Network | Port | Traefik |
+| --- | --- | --- | --- | --- |
+| `collie-waker-tunnel` | `tunnel` | pod network | `8787` | primary |
+| `collie-waker-main` | `waker` | `hostNetwork` | `8080` | fallback |
+
+Only the waker needs `hostNetwork`, because a magic packet must leave the node on the LAN. But
+`hostNetwork` publishes every port the pod binds on *every interface of the node* — so a tunnel in
+that namespace would put unrestricted access to Collie (Collie is a live terminal: treat it as a
+root login) on the LAN, defeating the point of Collie binding loopback in the first place.
+
+Keeping the tunnel in an ordinary pod confines it to the cluster network, reachable only through
+its ClusterIP. The private key is mounted into that pod alone. The waker's node-exposed port can
+do nothing but fire a rate-limited magic packet and redirect.
 
 ## Configuration
 
@@ -39,9 +54,10 @@ Every value is read from the environment; the Helm chart renders all of them fro
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `PORT` | `8080` | Waker HTTP listen port |
+| `ROLE` | `all` | `tunnel`, `waker`, or `all` (both in one process, for local runs) |
+| `PORT` | `8080` | HTTP listen port. The tunnel role serves only `/healthz` here |
 | `PUBLIC_HOST` | *required* | Host sent when polling Collie, and the 307 target |
-| `POLL_URL` | `http://127.0.0.1:8787/api/snapshot` | Where Collie is polled, through the tunnel |
+| `POLL_URL` | the tunnel Service | Where Collie is polled, through the tunnel pod |
 | `TIMEOUT_SECONDS` | `45` | Wake budget before the 503 page |
 | `HEALTH_INTERVAL_SECONDS` | `5` | One Traefik health-check interval |
 | `POLL_INTERVAL_MS` | `1000` | Delay between polls |
@@ -69,16 +85,20 @@ path is a wake request.
 process. Here Traefik must reach the tunnel *through the Service*, so the forward binds
 `ssh.tunnelBindAddr` instead — which requires `GatewayPorts=yes` on the `ssh` invocation.
 
+This is safe only because the tunnel role never runs with `hostNetwork`: `0.0.0.0` means every
+interface of the *pod*, and the pod has exactly one, reachable via its ClusterIP. Put this bind in
+the host namespace and it means every interface of the *node* instead. That is the trap the two-pod
+split exists to avoid, so do not merge the roles back into one deployment.
+
 ## Deployment
 
 The chart lives at `./charts/collie-waker` and is consumed by a Flux `HelmRelease` in
 [`jonmast/k8s-conf`](https://github.com/jonmast/k8s-conf) (`apps/collie-waker/`), which also owns
 the namespace, the SOPS-encrypted SSH key, and the Traefik failover routes.
 
-The pod runs with `hostNetwork: true` so the UDP broadcast actually leaves the node, and with a
-**liveness probe only**. A readiness probe is deliberately omitted: this pod's Service carries both
-the tunnel and the waker, so a failing readiness check would withdraw *all* endpoints and take the
-Traefik primary down along with the fallback.
+Both deployments run with a **liveness probe only**. A readiness probe is deliberately omitted: a
+failing check withdraws the endpoint, and an unreachable fallback means Traefik has nowhere to send
+traffic while the dev box is asleep — precisely when the waker is needed.
 
 ```sh
 make lint      # cargo check + clippy + helm lint

@@ -29,19 +29,35 @@ tab retries on its own.
 each of which enters the wake sequence and would otherwise broadcast its own packet. The limiter
 is shared process-wide, so a burst of requests produces one packet.
 
-## Why one container, not a sidecar
+## Why two pods, not one
 
-The tunnel and the waker are two ports on one pod. A sidecar split was considered and rejected:
-the `HelmRelease` contract in `k8s-conf` declares a single `controllers.main.containers.main` with
-both ports, one `ssh.*` value block, and one SSH key mount. Running the tunnel in-process also
-reuses `llm-wake-proxy`'s Dockerfile work of getting `/usr/bin/ssh` into a distroless image.
+One image, two deployments, selected by `ROLE`. The first cut ran both halves in a single pod with
+two ports, which is simpler and was what the original `HelmRelease` contract described. It was
+wrong.
+
+The waker needs `hostNetwork` so its magic packet reaches the physical LAN. `hostNetwork` shares
+the node's network namespace, so *every* port the pod binds is published on *every* interface of
+the node. That put the SSH tunnel — a forward straight into Collie, which is arbitrary keystrokes
+into a live terminal — on the LAN at `<node-ip>:8787`, bypassing Traefik, CrowdSec, and any
+identity proxy in front of them. The only thing left guarding it was Collie's `X-Device-Id`
+allowlist, whose value sat in plaintext in the Traefik middleware.
+
+The whole premise of the design is that Collie binds loopback and has no LAN-exposed port. A
+`hostNetwork` tunnel silently hands that back; it just moves the exposed port from the dev box to
+the k8s node.
+
+So the halves are split by blast radius: the waker keeps `hostNetwork` and can do nothing but fire
+a rate-limited magic packet and redirect, while the tunnel — and the SSH key, mounted into that pod
+alone — lives in an ordinary pod reachable only through its ClusterIP.
+
+Both roles ship in one image because they share the config loader and the distroless-plus-`ssh`
+Dockerfile inherited from `llm-wake-proxy`.
 
 ## Why there is no readiness probe
 
-The Service exposes both the tunnel (primary) and the waker (fallback), and readiness is
-pod-scoped, not port-scoped. A failing readiness probe on the waker's HTTP port would remove the
-pod from *both* endpoint sets, taking down the primary at the exact moment the fallback was also
-struggling. Liveness only.
+A failing readiness probe withdraws the pod's endpoint. For the waker that means Traefik has no
+fallback at the exact moment the dev box is asleep — precisely when the fallback is the only thing
+that can help. Liveness only, on both deployments.
 
 ## Relationship to llm-wake-proxy
 

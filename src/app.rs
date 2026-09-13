@@ -21,6 +21,13 @@ pub struct AppState {
     pub retry_after: Duration,
 }
 
+/// Router for a process that serves no wake handler — the tunnel role. It
+/// exists only so the kubelet has a liveness endpoint; everything else 404s
+/// rather than silently behaving like the fallback.
+pub fn health_only_router() -> Router {
+    Router::new().route("/healthz", get(healthz))
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Reserved: the kubelet liveness probe. Collie is not reachable at this
